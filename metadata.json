@@ -1,0 +1,6 @@
+{
+  "name": "MCQs SHIELD",
+  "description": "A secure online MCQ testing platform featuring AI-powered test generation, anti-cheat protection with a secret backdoor calculator, saved tests, and a searchable ledger of results.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

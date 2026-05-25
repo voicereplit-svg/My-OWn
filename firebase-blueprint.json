@@ -1,0 +1,77 @@
+{
+  "entities": {
+    "user": {
+      "title": "User Profile",
+      "description": "User profile with Google Auth details and settings",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "The firebase auth user ID" },
+        "email": { "type": "string", "description": "Gmail account identity" },
+        "displayName": { "type": "string", "description": "Display name" },
+        "photoURL": { "type": "string", "description": "Avatar photograph" },
+        "theme": { "type": "string", "enum": ["light", "dark"], "description": "Preferred UI theme" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["uid", "email"]
+    },
+    "test": {
+      "title": "MCQ Test Configuration",
+      "description": "MCQ assessment detailed configuration including questions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique index" },
+        "ownerUid": { "type": "string", "description": "UID of the creating educator" },
+        "ownerEmail": { "type": "string", "description": "Email of the creator" },
+        "name": { "type": "string", "description": "Assessment Title" },
+        "class": { "type": "string", "description": "Class or grade level" },
+        "subject": { "type": "string", "description": "Selected subject string" },
+        "topics": { "type": "string", "description": "Specific covered learning topics" },
+        "rollNumber": { "type": "string", "description": "Assigned base roll number" },
+        "difficulty": { "type": "string", "description": "Difficulty descriptor" },
+        "duration": { "type": "integer", "description": "Duration in minutes" },
+        "numMcqs": { "type": "integer", "description": "Target selection count" },
+        "pin": { "type": "string", "description": "Numeric login lockout PIN" },
+        "sourceType": { "type": "string", "enum": ["notes", "topic"], "description": "Generation logic basis" },
+        "notesContent": { "type": "string", "description": "Prompt text body" },
+        "questions": { "type": "array", "description": "Generated multiple choice collections" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Launch hour" }
+      },
+      "required": ["id", "ownerUid", "name", "questions"]
+    },
+    "result": {
+      "title": "Student Exam Result",
+      "description": "Historical result from a student session taking a test",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Generated index" },
+        "testId": { "type": "string", "description": "Reference ID" },
+        "ownerUid": { "type": "string", "description": "UID of the assessment administrator" },
+        "testName": { "type": "string", "description": "Title reference" },
+        "subject": { "type": "string", "description": "Topic reference" },
+        "studentRoll": { "type": "string", "description": "Roll number" },
+        "studentName": { "type": "string", "description": "Student candidate name" },
+        "score": { "type": "number", "description": "Correct items score" },
+        "totalQuestions": { "type": "integer", "description": "Assessment set items" },
+        "durationTaken": { "type": "integer", "description": "Time elapsed in seconds" },
+        "completedAt": { "type": "string", "format": "date-time", "description": "Time of submission" },
+        "cheated": { "type": "boolean", "description": "Cheater status indication badge" },
+        "securityLogs": { "type": "array", "description": "System integrity compliance audits" }
+      },
+      "required": ["id", "testId", "ownerUid", "studentName", "score"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "user",
+      "description": "Registered educational users"
+    },
+    "tests/{testId}": {
+      "schema": "test",
+      "description": "Generated exam question templates"
+    },
+    "results/{resultId}": {
+      "schema": "result",
+      "description": "Submitted student quiz answer results"
+    }
+  }
+}

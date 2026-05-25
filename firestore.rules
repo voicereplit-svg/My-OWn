@@ -1,0 +1,79 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Users Collection ---
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create, update: if isOwner(userId) 
+        && incoming().uid == userId
+        && incoming().email is string
+        && incoming().email.size() <= 200
+        && incoming().displayName is string
+        && incoming().displayName.size() <= 200;
+    }
+
+    // --- Tests Collection ---
+    match /tests/{testId} {
+      // Anyone can GET a test (to allow students without account to load questions)
+      allow get: if true;
+      
+      // Only the logged in owner can list tests they created
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+      
+      // Create test
+      allow create: if isSignedIn() 
+        && incoming().ownerUid == request.auth.uid
+        && incoming().id == testId
+        && incoming().name is string
+        && incoming().name.size() <= 200
+        && incoming().questions is list;
+        
+      // Update/delete test
+      allow update, delete: if isSignedIn() 
+        && existing().ownerUid == request.auth.uid
+        && incoming().ownerUid == request.auth.uid;
+    }
+
+    // --- Results Collection ---
+    match /results/{resultId} {
+      // Allow student to submit results
+      allow create: if true 
+        && incoming().id == resultId
+        && incoming().testId is string
+        && incoming().studentName is string
+        && incoming().studentName.size() <= 200;
+
+      // Allow teachers to view/list results that they own (where they created the associated testId)
+      // Since O(n) lookups inside allow list are prohibited, teachers filter by ownerUid check
+      allow read, list: if isSignedIn() && (
+        resource.data.ownerUid == request.auth.uid
+      );
+    }
+  }
+}
