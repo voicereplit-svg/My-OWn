@@ -12,15 +12,25 @@ const PORT = 3000;
 // Middleware for parsing JSON with a generous size limit for large notes
 app.use(express.json({ limit: "20mb" }));
 
-// Initialize Google Gen AI
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
-});
+// Initialize Google Gen AI lazily
+let aiInstance: GoogleGenAI | null = null;
+function getAI(): GoogleGenAI {
+  if (!aiInstance) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY environment variable is currently not configured. Please supply a valid AI Studio api-key in the application settings.");
+    }
+    aiInstance = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+  return aiInstance;
+}
 
 // Endpoint for checking system health
 app.get("/api/health", (req, res) => {
@@ -72,7 +82,7 @@ app.post("/api/generate-mcqs", async (req, res) => {
       Every question must have exactly 4 plausible options, with exactly one definitely correct answer.
       Write the response strictly matching the requested JSON schema.`;
 
-      const response = await ai.models.generateContent({
+      const response = await getAI().models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
         config: {

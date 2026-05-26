@@ -41,8 +41,7 @@ import {
   Info,
   ExternalLink,
   User,
-  Volume2,
-  VolumeX
+  RefreshCw
 } from "lucide-react";
 import { MCQQuestion, TestConfig, StudentResult, TestDifficulty } from "./types";
 import FloatingCalculator from "./components/FloatingCalculator";
@@ -61,13 +60,68 @@ const safeBtoa = (str: string): string => {
 // Helper to decode safe Base64 to UTF-8
 const safeAtob = (str: string): string => {
   try {
-    return decodeURIComponent(atob(str).split('').map((c) => {
-      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-    }).join(''));
-  } catch (e) {
-    // Fallback for legacy ASCII Base64 encoded links
-    return atob(str);
+    // Sanitization: strip whitespaces and convert space to '+' (often converted during URL copying)
+    let cleaned = str.trim().replace(/\s/g, "");
+    cleaned = cleaned.replace(/ /g, "+");
+    
+    // Auto-pad Base64 if needed
+    const padNeeded = (4 - (cleaned.length % 4)) % 4;
+    if (padNeeded > 0) {
+      cleaned += "=".repeat(padNeeded);
+    }
+
+    try {
+      const decodedCharBytes = atob(cleaned);
+      return decodeURIComponent(decodedCharBytes.split('').map((c) => {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+    } catch (innerErr) {
+      // Fallback for standard/simple ASCII Base64 encoded links
+      return atob(cleaned);
+    }
+  } catch (e: any) {
+    throw new Error("Base64 decoding failed: " + e.message);
   }
+};
+
+// Helper to shuffle exam questions and options while preserving correct coordinates
+const shuffleExam = (originalExam: TestConfig): TestConfig => {
+  const examCopy = { ...originalExam };
+  if (!examCopy.questions || !Array.isArray(examCopy.questions)) {
+    return examCopy;
+  }
+
+  // Shuffle options of each question and update the correctIndex map
+  const shuffledQuestions = examCopy.questions.map(q => {
+    const correctOptionText = q.options[q.correctIndex] || "";
+    const shuffledOptions = [...q.options];
+    
+    // Fisher-Yates shuffle
+    for (let i = shuffledOptions.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const temp = shuffledOptions[i];
+      shuffledOptions[i] = shuffledOptions[j];
+      shuffledOptions[j] = temp;
+    }
+    
+    const newCorrectIndex = shuffledOptions.indexOf(correctOptionText);
+    return {
+      ...q,
+      options: shuffledOptions,
+      correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex
+    };
+  });
+
+  // Shuffle order of questions themselves
+  for (let i = shuffledQuestions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = shuffledQuestions[i];
+    shuffledQuestions[i] = shuffledQuestions[j];
+    shuffledQuestions[j] = temp;
+  }
+
+  examCopy.questions = shuffledQuestions;
+  return examCopy;
 };
 
 // Import our new unified cloud Firebase with local backup
@@ -154,6 +208,25 @@ export default function App() {
     });
   };
 
+  const handlePageRefresh = async () => {
+    audio.playClick();
+    setIsLoadingData(true);
+    try {
+      if (currentUser) {
+        await syncPersonalHistory(currentUser);
+      } else {
+        const tests = await fetchTestsCloud();
+        const results = await fetchResultsCloud();
+        setSavedTestsList(tests);
+        setResultsList(results);
+      }
+    } catch (e) {
+      console.error("Manual in-app refresh failed:", e);
+    } finally {
+      setIsLoadingData(false);
+    }
+  };
+
   const requestConfirm = (title: string, message: string, onConfirm: () => void, confirmText = "Confirm") => {
     setConfirmDialog({
       title,
@@ -171,6 +244,7 @@ export default function App() {
   const [studentName, setStudentName] = useState<string>("");
   const [studentRoll, setStudentRoll] = useState<string>("");
   const [isExamStarted, setIsExamStarted] = useState<boolean>(false);
+  const [isQuestionBoxOpen, setIsQuestionBoxOpen] = useState<boolean>(false);
   const [examPinInput, setExamPinInput] = useState<string>("");
   const [examPinError, setExamPinError] = useState<string | null>(null);
 
@@ -316,11 +390,31 @@ export default function App() {
 
   // Google Login click handler
   const handleGoogleLogin = async () => {
+    if (!isFirebaseConfigured()) {
+      alert("Firebase is not properly set up at this moment. Please check the firebase-applet-config.json file contents.");
+      return;
+    }
+    if (authLoading) return;
     try {
       setAuthLoading(true);
       await authenticateWithGoogle();
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      console.error("Authentication error background info:", e);
+      const errMsg = e?.message || String(e);
+      // Clean, user-friendly cancellation check
+      if (
+        errMsg.includes("cancelled-popup-request") || 
+        errMsg.includes("popup-closed-by-user") || 
+        errMsg.includes("auth/popup-closed-by-user") || 
+        errMsg.includes("auth/cancelled-popup-request")
+      ) {
+        console.warn("User closed or cancelled Google sign-in popup.");
+      } else {
+        alert(
+          "Google Authentication failed: " + errMsg + 
+          "\n\nTip: If you are inside the embedded sandbox preview, try opening the application in a new browser tab/window using the URL bar or top-right expansion button."
+        );
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -459,18 +553,21 @@ export default function App() {
       durationTaken: examDurationTaken,
       completedAt: new Date().toISOString(),
       cheated: true,
-      securityLogs: [...currentLogs, `[${new Date().toLocaleTimeString()}] EXAM FORCE-CLOSED & AUTO-SUBMITTED ON SECURITY LOCK. Final Score recorded: ${score}/${activeExam.questions.length}`]
+      securityLogs: [...currentLogs, `[${new Date().toLocaleTimeString()}] EXAM FORCE-CLOSED & AUTO-SUBMITTED ON SECURITY LOCK. Final Score recorded: ${score}/${activeExam.questions.length}`],
+      ownerUid: activeExam.ownerUid,
     };
 
-    try {
-      await saveResultCloud(finalResult);
-      if (currentUser) {
-        const updated = await fetchResultsCloud();
-        setResultsList(updated);
-      }
-    } catch (e) {
-      console.error("Failed saving locked student answers to secure cloud database", e);
-    }
+    // Save in the background so slow cloud writes never hang the submission UI
+    saveResultCloud(finalResult)
+      .then(async () => {
+        if (currentUser) {
+          const updated = await fetchResultsCloud();
+          setResultsList(updated);
+        }
+      })
+      .catch((e) => {
+        console.error("Failed saving locked student answers to secure cloud database", e);
+      });
 
     setExamResult(finalResult);
   };
@@ -567,6 +664,7 @@ export default function App() {
         notesContent: generationType === "notes" ? notesText : undefined,
         questions: data.questions,
         createdAt: new Date().toISOString(),
+        ownerUid: currentUser?.uid,
       };
 
       setCreatedTest(newTest);
@@ -580,10 +678,58 @@ export default function App() {
 
   // Save the freshly generated test securely to the User's Cloud DB mapping
   const saveCreatedTestToLibrary = async () => {
-    if (!createdTest || !currentUser) return;
+    if (!createdTest) return;
+
+    if (!currentUser) {
+      requestConfirm(
+        "Sign In Required",
+        "Would you like to sign in with Google to save this assessment, keep track of security monitor keys, and receive live student scoring securely on the cloud?",
+        async () => {
+          try {
+            setAuthLoading(true);
+            const user = await authenticateWithGoogle();
+            if (user) {
+              await proceedToSave(user);
+            }
+          } catch (e: any) {
+            console.error("Sign-in error before saving", e);
+            const errMsg = e?.message || String(e);
+            if (
+              errMsg.includes("cancelled-popup-request") || 
+              errMsg.includes("popup-closed-by-user") || 
+              errMsg.includes("auth/popup-closed-by-user") || 
+              errMsg.includes("auth/cancelled-popup-request")
+            ) {
+              console.warn("User closed or cancelled sign-in popup from save dialog.");
+            } else {
+              alert(
+                "Google Authentication failed: " + errMsg + 
+                "\n\nTip: If you are inside the embedded sandbox preview, try opening the application in a new browser tab/window first."
+              );
+            }
+          } finally {
+            setAuthLoading(false);
+          }
+        },
+        "Sign In & Save"
+      );
+      return;
+    }
+
+    await proceedToSave(currentUser);
+  };
+
+  const proceedToSave = async (user: ActiveUser) => {
+    if (!createdTest) return;
     setIsLoadingData(true);
     try {
-      await saveTestCloud(createdTest);
+      const updatedTestWithAuth: TestConfig = {
+        ...createdTest,
+        ownerUid: user.uid
+      };
+      await saveTestCloud(updatedTestWithAuth);
+      setCreatedTest(updatedTestWithAuth);
+      
       // reload live list
       const updated = await fetchTestsCloud();
       setSavedTestsList(updated);
@@ -629,42 +775,73 @@ export default function App() {
     setTimeout(() => setIsCopied(false), 2000);
   };
 
-  const handleLaunchPastedLink = async (e: React.FormEvent) => {
+   const handleLaunchPastedLink = async (e: React.FormEvent) => {
     e.preventDefault();
     setLinkError(null);
 
     try {
-      if (!pastedLink.trim()) {
-        throw new Error("Please specify a valid exam portal link.");
+      const trimmedToken = pastedLink.trim();
+      if (!trimmedToken) {
+        throw new Error("Please specify a valid exam portal link or configuration token.");
       }
 
       let base64Segment = "";
-      if (pastedLink.includes("testData=")) {
-        const urlObj = new URL(pastedLink.trim());
-        base64Segment = urlObj.searchParams.get("testData") || "";
+      if (trimmedToken.includes("testData=")) {
+        // Robust parameter matching that doesn't crash on incomplete/protocol-less URLs
+        const match = trimmedToken.match(/[?&]testData=([^&]+)/);
+        if (match) {
+          base64Segment = match[1];
+        } else {
+          // Fallback parsing strategy
+          base64Segment = trimmedToken.split("testData=")[1] || "";
+        }
       } else {
-        base64Segment = pastedLink.trim();
+        base64Segment = trimmedToken;
       }
 
-      if (!base64Segment) {
+      let decodedBase64 = base64Segment;
+      try {
+        decodedBase64 = decodeURIComponent(base64Segment);
+      } catch (e) {
+        // Proceed with raw base64
+      }
+
+      if (!decodedBase64) {
         throw new Error("No exam configuration payload found inside this link.");
       }
 
-      const decoded = JSON.parse(safeAtob(base64Segment));
+      const decoded = JSON.parse(safeAtob(decodedBase64));
       if (!decoded.questions || !Array.isArray(decoded.questions)) {
         throw new Error("Invalid decoded JSON payload configuration.");
       }
 
-      // If user is a teacher, save this test configuration directly on the cloud
+      // If user is a teacher, try to auto-sync this test configuration directly on the cloud in the background so it never blocks launching the exam
       if (currentUser) {
-        await saveTestCloud(decoded);
-        const updated = await fetchTestsCloud();
-        setSavedTestsList(updated);
+        const decodedWithAuth = {
+          ...decoded,
+          ownerUid: currentUser.uid
+        };
+        // Load the exam immediately to prevent any UI freeze/hangs
+        setActiveExam(decodedWithAuth);
+        
+        // Asynchronously save in background
+        saveTestCloud(decodedWithAuth)
+          .then(() => fetchTestsCloud())
+          .then((updated) => {
+            setSavedTestsList(updated);
+          })
+          .catch((dbErr) => {
+            console.warn("Cloud DB sync in background skipped/skipped:", dbErr);
+          });
+      } else {
+        setActiveExam(decoded);
       }
 
-      setActiveExam(decoded);
       setStudentRoll(decoded.rollNumber || "");
       setPastedLink("");
+      setExamPinInput("");
+      setExamPinError(null);
+      setCurrentView("link");
     } catch (err: any) {
       setLinkError(err.message || "Failed decoding exam link. Please check the integrity of input.");
     }
@@ -697,13 +874,16 @@ export default function App() {
     }
 
     audio.playCorrect();
+    const shuffled = shuffleExam(activeExam);
+    setActiveExam(shuffled);
     setSelectedAnswers({});
     setCurrentQuestionIndex(0);
-    setTimeLeft(activeExam.duration * 60);
+    setTimeLeft(shuffled.duration * 60);
     setExamCompleted(false);
     setExamDurationTaken(0);
     setHasCheatedFlag(false);
     setIsExamLocked(false);
+    setIsQuestionBoxOpen(false);
     setCheatLogs([`[${new Date().toLocaleTimeString()}] exam locked session initiated by ${studentName} (Roll: ${studentRoll})`]);
     setIsExamStarted(true);
   };
@@ -731,19 +911,21 @@ export default function App() {
       durationTaken: examDurationTaken,
       completedAt: new Date().toISOString(),
       cheated: hasCheatedFlag,
-      securityLogs: [...cheatLogs, `[${new Date().toLocaleTimeString()}] Student exam ended with secure logging. Final score: ${score}/${activeExam.questions.length}`]
+      securityLogs: [...cheatLogs, `[${new Date().toLocaleTimeString()}] Student exam ended with secure logging. Final score: ${score}/${activeExam.questions.length}`],
+      ownerUid: activeExam.ownerUid,
     };
 
-    try {
-      // Direct cloud sync representation
-      await saveResultCloud(finalResult);
-      if (currentUser) {
-        const updated = await fetchResultsCloud();
-        setResultsList(updated);
-      }
-    } catch (e) {
-      console.error("Failed saving student score to secure database", e);
-    }
+    // Direct non-blocking cloud sync representation
+    saveResultCloud(finalResult)
+      .then(async () => {
+        if (currentUser) {
+          const updated = await fetchResultsCloud();
+          setResultsList(updated);
+        }
+      })
+      .catch((e) => {
+        console.error("Failed saving student score to secure database", e);
+      });
 
     // Sound feedback on completion
     if (activeExam.questions.length > 0) {
@@ -861,16 +1043,28 @@ export default function App() {
         <div className="space-y-4 pt-2">
           <button
             onClick={handleGoogleLogin}
-            className={`w-full py-3.5 px-6 rounded-2xl font-bold flex items-center justify-center space-x-3 transition-transform duration-200 hover:scale-[1.01] active:scale-[0.99] cursor-pointer shadow-lg tracking-wide ${
+            disabled={authLoading}
+            className={`w-full py-3.5 px-6 rounded-2xl font-bold flex items-center justify-center space-x-3 transition-all duration-200 cursor-pointer shadow-lg tracking-wide ${
+              authLoading ? "opacity-60 cursor-not-allowed" : "hover:scale-[1.01] active:scale-[0.99]"
+            } ${
               isDark 
                 ? "bg-indigo-600 text-white hover:bg-indigo-500 shadow-indigo-900/10" 
                 : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-slate-900/10"
             }`}
           >
-            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12.24 10.285V13.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.578-7.859-8s3.53-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l2.427-2.334C17.955 2.192 15.34 1 12.24 1 6.033 1 12.24s5.033 11.24 11.24 11.24c6.478 0 10.793-4.537 10.793-10.986 0-.745-.075-1.3-.173-1.854l-10.62-.355z"/>
-            </svg>
-            <span>Sign in with Google</span>
+            {authLoading ? (
+              <div className="flex items-center space-x-2">
+                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                <span>Signing in...</span>
+              </div>
+            ) : (
+              <>
+                <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12.24 10.285V13.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.578-7.859-8s3.53-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l2.427-2.334C17.955 2.192 15.34 1 12.24 1 6.033 1 12.24s5.033 11.24 11.24 11.24c6.478 0 10.793-4.537 10.793-10.986 0-.745-.075-1.3-.173-1.854l-10.62-.355z"/>
+                </svg>
+                <span>Sign in with Google</span>
+              </>
+            )}
           </button>
 
           <button
@@ -1108,27 +1302,107 @@ export default function App() {
                     isDark ? "bg-[#111827]/45 border-[#2C3636]/60 shadow-lg" : "bg-white/50 border-[#D6DBDB]/80 shadow-md"
                   }`}>
                     
-                    {/* Index Tags navigation progress trackers */}
-                    <div className="flex flex-wrap gap-2 pb-5 border-b border-dashed border-slate-700/50">
-                      {activeExam.questions.map((_, index) => {
-                        const isVisited = selectedAnswers[index] !== undefined;
-                        const isCurrent = currentQuestionIndex === index;
-                        return (
-                          <button
-                            key={index}
-                            onClick={() => setCurrentQuestionIndex(index)}
-                            className={`w-9 h-9 rounded-lg font-mono text-xs font-bold transition-all flex items-center justify-center border cursor-pointer ${
-                              isCurrent
-                                ? isDark ? "bg-indigo-500/20 text-indigo-400 border-indigo-400" : "bg-indigo-100 text-indigo-750 border-indigo-400"
-                                : isVisited
-                                ? isDark ? "bg-slate-800 text-slate-200 border-[#323D3D]" : "bg-[#EEF1F1] text-slate-700 border-[#C3C9C9]"
-                                : isDark ? "text-slate-500 border-[#323D3D] hover:text-slate-300" : "text-slate-400 border-slate-200 hover:text-slate-800"
-                            }`}
-                          >
-                            {index + 1}
-                          </button>
-                        );
-                      })}
+                    {/* Index Tags navigation progress trackers, moved to an expandable box button */}
+                    <div className="pb-5 border-b border-dashed border-[#CDD2D2]/50 dark:border-slate-700/50 space-y-3">
+                      <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsQuestionBoxOpen(!isQuestionBoxOpen);
+                            audio.playClick();
+                          }}
+                          className={`w-full sm:w-auto px-5 py-3 rounded-2xl border flex items-center justify-between sm:space-x-4 transition-all hover:scale-[1.01] active:scale-[0.99] cursor-pointer shadow-sm ${
+                            isDark 
+                              ? "bg-slate-800/80 border-slate-700 text-slate-100 hover:bg-slate-800" 
+                              : "bg-[#F3F5F5] border-slate-200 text-slate-800 hover:bg-[#EBF0F0]"
+                          }`}
+                        >
+                          <div className="flex items-center space-x-2.5">
+                            <span className="text-lg">📦</span>
+                            <div className="text-left">
+                              <span className="text-xs font-bold block tracking-tight">Question Navigator Box</span>
+                              <span className="text-[10px] font-mono opacity-60">
+                                Completed: <strong className="text-emerald-500 font-bold">{Object.keys(selectedAnswers).length}</strong> of {activeExam.questions.length}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex items-center space-x-2 shrink-0">
+                            {/* Visual pill showing status */}
+                            <span className={`text-[10px] font-bold font-mono px-2 py-0.5 rounded-full ${
+                              Object.keys(selectedAnswers).length === activeExam.questions.length
+                                ? "bg-emerald-500/10 text-emerald-500 border border-emerald-500/20"
+                                : "bg-amber-500/10 text-amber-500 border border-amber-500/20"
+                            }`}>
+                              {Math.round((Object.keys(selectedAnswers).length / activeExam.questions.length) * 100)}% Done
+                            </span>
+                            <span className="text-xs opacity-50 transition-all">
+                              {isQuestionBoxOpen ? "▲" : "▼"}
+                            </span>
+                          </div>
+                        </button>
+
+                        {/* Fast HUD status summary next to it */}
+                        <div className="hidden sm:flex items-center space-x-2 text-xs opacity-50 font-mono">
+                          <span>Current Focus: Question #{currentQuestionIndex + 1}</span>
+                        </div>
+                      </div>
+
+                      {/* Expandable Box content with the actual numbered buttons */}
+                      {isQuestionBoxOpen && (
+                        <div className={`p-4 rounded-2xl border p-5 space-y-3 animate-fadeIn duration-200 ${
+                          isDark ? "bg-[#181D1D]/90 border-indigo-500/20" : "bg-indigo-50/20 border-indigo-100"
+                        }`}>
+                          <div className="flex items-center justify-between border-b border-dashed border-[#CDD2D2]/25 dark:border-slate-700/20 pb-2">
+                            <span className="text-xs font-semibold">
+                              Select a number to jump to question:
+                            </span>
+                            <button 
+                              onClick={() => {
+                                setIsQuestionBoxOpen(false);
+                                audio.playClick();
+                              }}
+                              className="text-[10px] font-mono hover:underline text-indigo-500 cursor-pointer"
+                            >
+                              Hide Box [×]
+                            </button>
+                          </div>
+                          
+                          <div className="flex flex-wrap gap-2.5">
+                            {activeExam.questions.map((_, index) => {
+                              const isVisited = selectedAnswers[index] !== undefined;
+                              const isCurrent = currentQuestionIndex === index;
+                              return (
+                                <button
+                                  key={index}
+                                  onClick={() => {
+                                    setCurrentQuestionIndex(index);
+                                    audio.playClick();
+                                  }}
+                                  className={`w-11 h-11 rounded-xl font-mono text-xs font-bold transition-all flex flex-col items-center justify-center border cursor-pointer relative ${
+                                    isCurrent
+                                      ? isDark 
+                                        ? "bg-indigo-500/25 text-white border-indigo-400 font-extrabold ring-2 ring-indigo-500/40" 
+                                        : "bg-indigo-100 text-indigo-900 border-indigo-400 font-extrabold ring-2 ring-indigo-600/20"
+                                      : isVisited
+                                      ? isDark ? "bg-emerald-950/40 text-emerald-400 border-emerald-500/30" : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                                      : isDark ? "text-slate-500 border-slate-750 bg-slate-800/30 hover:text-slate-350" : "text-slate-400 border-slate-200 bg-white hover:text-slate-800"
+                                  }`}
+                                  title={isVisited ? "Answered" : "Unanswered"}
+                                >
+                                  <span>{index + 1}</span>
+                                  {isVisited && (
+                                    <span className="absolute bottom-0.5 text-[8px] text-emerald-500 font-bold">•</span>
+                                  )}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          
+                          <div className="text-[10px] opacity-40 italic">
+                            💡 Click on any of the question numbers above to navigate directly during the exam. Done/Answered questions have green tinted circles with indicator dots.
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Show Active Question and Optional Diagram */}
@@ -1307,15 +1581,15 @@ export default function App() {
                 {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
               </button>
 
-              {/* Sound controls option */}
+              {/* Refresh option (dynamic in-app reload) */}
               <button
-                onClick={toggleMute}
-                className={`p-2 border rounded-xl hover:scale-105 transition-all cursor-pointer ${
+                onClick={handlePageRefresh}
+                className={`p-2 border rounded-xl hover:scale-105 transition-all cursor-pointer flex items-center justify-center ${
                   isDark ? "bg-[#232B2B] border-[#323D3D] text-indigo-400" : "bg-[#F3F5F5] border-[#CDD2D2] text-slate-700"
                 }`}
-                title={isAudioMuted ? "Unmute Sound Effects" : "Mute Sound Effects"}
+                title="Refresh Cloud Lists & Sync Profiles"
               >
-                {isAudioMuted ? <VolumeX className="w-4 h-4 text-red-500" /> : <Volume2 className="w-4 h-4 text-emerald-500" />}
+                <RefreshCw className={`w-4 h-4 ${isLoadingData ? "animate-spin text-indigo-500" : "text-emerald-500"}`} />
               </button>
 
               {/* Account integration picture details */}
@@ -1327,10 +1601,21 @@ export default function App() {
                     </p>
                     <p className="text-[10px] font-mono text-slate-500 truncate">{currentUser.email}</p>
                   </div>
-                  <div className={`w-9 h-9 rounded-full border flex items-center justify-center shrink-0 ${
-                    isDark ? "bg-[#1E2525] border-teal-900/40 text-teal-400" : "bg-slate-100 border-slate-300 text-slate-700"
-                  }`}>
-                    <User className="w-5 h-5" />
+                  <div className="w-9 h-9 rounded-full overflow-hidden border shrink-0 border-indigo-500/30">
+                    {currentUser.photoURL ? (
+                      <img 
+                        src={currentUser.photoURL} 
+                        alt={currentUser.displayName} 
+                        className="w-full h-full object-cover"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <div className={`w-full h-full flex items-center justify-center ${
+                        isDark ? "bg-[#1E2525] text-teal-400" : "bg-slate-100 text-slate-700"
+                      }`}>
+                        <User className="w-5 h-5" />
+                      </div>
+                    )}
                   </div>
                   <button
                     onClick={handleGoogleLogout}
@@ -1349,16 +1634,28 @@ export default function App() {
                   <span className="hidden sm:inline text-[11px] font-mono opacity-50">Browsing as Guest</span>
                   <button
                     onClick={handleGoogleLogin}
-                    className={`text-xs select-none cursor-pointer py-1.5 px-3.5 rounded-xl font-bold border flex items-center space-x-1.5 transition-all duration-200 hover:scale-[1.01] active:scale-[0.99] ${
+                    disabled={authLoading}
+                    className={`text-xs select-none cursor-pointer py-1.5 px-3.5 rounded-xl font-bold border flex items-center space-x-1.5 transition-all duration-200 ${
+                      authLoading ? "opacity-60 cursor-not-allowed" : "hover:scale-[1.01] active:scale-[0.99]"
+                    } ${
                       isDark 
                         ? "bg-[#111827] border-[#1F2937] text-indigo-400 hover:bg-slate-800 hover:border-indigo-500/50 hover:text-indigo-300" 
                         : "bg-white border-slate-300 text-indigo-600 hover:bg-slate-50 hover:border-indigo-500"
                     }`}
                   >
-                    <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M12.24 10.285V13.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.578-7.859-8s3.53-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l2.427-2.334C17.955 2.192 15.34 1 12.24 1 6.033 1 12.24s5.033 11.24 11.24 11.24c6.478 0 10.793-4.537 10.793-10.986 0-.745-.075-1.3-.173-1.854l-10.62-.355z"/>
-                    </svg>
-                    <span>Sign in with Google</span>
+                    {authLoading ? (
+                      <div className="flex items-center space-x-1.5">
+                        <div className="w-3.5 h-3.5 border border-indigo-400/30 border-t-indigo-400 rounded-full animate-spin" />
+                        <span>Signing in...</span>
+                      </div>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M12.24 10.285V13.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.859-3.578-7.859-8s3.53-8 7.859-8c2.46 0 4.105 1.025 5.047 1.926l2.427-2.334C17.955 2.192 15.34 1 12.24 1 6.033 1 12.24s5.033 11.24 11.24 11.24c6.478 0 10.793-4.537 10.793-10.986 0-.745-.075-1.3-.173-1.854l-10.62-.355z"/>
+                        </svg>
+                        <span>Sign in with Google</span>
+                      </>
+                    )}
                   </button>
                 </div>
               )}
@@ -1843,7 +2140,11 @@ export default function App() {
 
 
                 {/* Library list */}
-                {savedTestsList.length === 0 ? (
+                {isLoadingData ? (
+                  <div className="py-12 text-center text-xs opacity-50 font-mono animate-pulse">
+                    Retrieving synced assessments from cloud databases...
+                  </div>
+                ) : savedTestsList.length === 0 ? (
                   <div className={`border rounded-2xl p-12 text-center transition-all backdrop-blur-md ${
                     isDark ? "bg-[#111827]/10 border-slate-700/20 shadow-xs" : "bg-white/10 border-slate-200/35 shadow-xs"
                   }`}>
@@ -1923,6 +2224,7 @@ export default function App() {
                               setStudentName("");
                               setExamPinInput("");
                               setExamPinError(null);
+                              setCurrentView("link");
                               audio.playClick();
                             }}
                             className={`py-2 px-3 border rounded-xl text-xs font-semibold flex items-center justify-center space-x-1.5 transition-all cursor-pointer ${
@@ -2069,17 +2371,70 @@ export default function App() {
                   <form onSubmit={startExamVerification} className={`rounded-3xl border p-6 space-y-5 transition-all duration-300 backdrop-blur-md ${
                     isDark ? "bg-[#111827]/10 border-slate-700/20 shadow-sm" : "bg-white/10 border-slate-205/35 shadow-sm"
                   }`}>
-                    <div className="flex items-center space-x-3.5 pb-4 border-b border-slate-705/30">
-                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold border ${
-                        isDark ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/10" : "bg-indigo-50 text-indigo-750"
-                      }`}>
-                        ✍️
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between sm:space-x-3.5 pb-4 border-b border-dashed border-slate-700/30">
+                      <div className="flex items-center space-x-3.5 flex-1">
+                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold border shrink-0 ${
+                          isDark ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/15" : "bg-indigo-50 text-indigo-750"
+                        }`}>
+                          ✍️
+                        </div>
+                        <div className="overflow-hidden">
+                          <span className="text-[9px] uppercase font-mono text-indigo-400 font-bold block">Assigned Assessment</span>
+                          <h4 className="text-sm font-semibold truncate leading-tight">{activeExam.name}</h4>
+                          <span className="text-[10px] text-slate-400 font-mono tracking-tight block mt-0.5">{activeExam.subject} ({activeExam.questions.length} MCQs)</span>
+                        </div>
                       </div>
-                      <div className="overflow-hidden">
-                        <span className="text-[9px] uppercase font-mono text-slate-500 font-bold block">Assigned Assessment</span>
-                        <h4 className="text-sm font-semibold truncate leading-tight">{activeExam.name}</h4>
-                        <span className="text-[10px] text-slate-400 font-mono tracking-tight block mt-0.5">{activeExam.subject} ({activeExam.questions.length} MCQs)</span>
+                      
+                      {/* Paste clear/back action to paste totally manually if preferred */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveExam(null);
+                          audio.playClick();
+                        }}
+                        className="mt-3 sm:mt-0 px-3 py-1.5 rounded-xl text-[10px] font-bold border border-rose-500/20 hover:bg-rose-500/10 text-rose-500 transition-colors shrink-0 cursor-pointer text-center"
+                      >
+                        Reset / Paste Another
+                      </button>
+                    </div>
+
+                    {/* Integrated Place to paste another link right in the active exam screen */}
+                    <div className={`p-4 border rounded-2xl space-y-2.5 transition-all ${
+                      isDark ? "bg-[#181D1D]/70 border-slate-750/50" : "bg-slate-50/70 border-slate-200"
+                    }`}>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-indigo-400 dark:text-indigo-400 flex items-center gap-1.5">
+                          🔗 Paste new invitation link or token below
+                        </span>
                       </div>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder="Paste search URL copy or code payload..."
+                          value={pastedLink}
+                          onChange={(e) => setPastedLink(e.target.value)}
+                          className={`flex-1 py-1.5 px-3 border rounded-xl text-xs font-mono focus:ring-2 focus:ring-indigo-500/20 focus:outline-none focus:border-indigo-500 ${
+                            isDark ? "bg-[#111313] border-[#323D3D] text-white placeholder-slate-650" : "bg-white border-slate-300 text-slate-900 placeholder-slate-400"
+                          }`}
+                        />
+                        <button
+                          type="button"
+                          onClick={async (e) => {
+                            e.preventDefault();
+                            await handleLaunchPastedLink({ preventDefault: () => {} } as any);
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all ${
+                            isDark ? "bg-indigo-600 hover:bg-indigo-500 text-white" : "bg-indigo-600 hover:bg-indigo-700 text-white font-semibold"
+                          }`}
+                        >
+                          Load
+                        </button>
+                      </div>
+                      {linkError && (
+                        <p className="text-[10px] text-red-500 leading-tight font-medium">
+                          {linkError}
+                        </p>
+                      )}
                     </div>
 
                     <div className="grid grid-cols-2 gap-4">
